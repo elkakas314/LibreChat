@@ -243,6 +243,7 @@ describe('FollowedThread', () => {
     expect(contract).toMatchObject({
       index: 2,
       messagesKey: 'thread-1',
+      readOnly: true,
       isSubmitting: false,
       latestMessageId: 'task-1:assistant',
       conversation: { conversationId: 'thread-1' },
