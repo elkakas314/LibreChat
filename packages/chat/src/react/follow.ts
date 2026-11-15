@@ -24,9 +24,12 @@ export type FollowChatOptions = {
   loadMessages: () => Promise<TMessage[]>;
   /**
    * Whether the caller knows a generation is running. Turning true attaches to it, which covers a
-   * run that starts after the conversation was opened.
+   * run that starts after the conversation was opened; turning false reads the stored messages
+   * again, which covers a run that ended without a stream to say so.
    */
   live?: boolean;
+  /** False follows nothing: no read, no stream, and an idle result. */
+  enabled?: boolean;
   /** Live status a step reports beside the message list. */
   onEffect?: (effect: EventApplierEffect) => void;
   /** Every stream event after it was applied: usage, titles, attachments. */
@@ -44,12 +47,18 @@ export type FollowedChat = {
   error: Error | undefined;
   /** Whether the stored messages are still being read for the first time. */
   isLoading: boolean;
+  /**
+   * Whether a generation is being followed: from the moment an attach starts until its stream has
+   * ended and the stored messages were read again. False with `live` set means there is nothing
+   * to attach to.
+   */
+  isFollowing: boolean;
   /** Whether the stored messages could not be read; `retry` reads them again. */
   isLoadError: boolean;
   retry: () => void;
 };
 
-type Entry = { id: string; chat: Chat; attach: () => Promise<void> };
+type Entry = { id: string; chat: Chat; attach: () => Promise<void>; settle: () => Promise<void> };
 type Load = { id: string; attempt: number; state: 'loading' | 'ready' | 'error' };
 
 const noMessages: TMessage[] = [];
@@ -78,6 +87,7 @@ export function useFollowChat({
   transport,
   loadMessages,
   live = false,
+  enabled = true,
   onEffect,
   onEvent,
   onFinish,
@@ -88,8 +98,14 @@ export function useFollowChat({
   const [attempt, setAttempt] = useState(0);
   const [entry, setEntry] = useState<Entry>();
   const [load, setLoad] = useState<Load>({ id, attempt, state: 'loading' });
+  const [following, setFollowing] = useState(false);
+  const wasLive = useRef(false);
 
   useEffect(() => {
+    if (!enabled) {
+      setEntry(undefined);
+      return;
+    }
     let stale = false;
     let loaded = false;
     let attaching = false;
@@ -129,6 +145,7 @@ export function useFollowChat({
         return;
       }
       attaching = true;
+      setFollowing(true);
       try {
         await chat.resumeStream();
         await read();
@@ -136,6 +153,21 @@ export function useFollowChat({
         /** The chat reports a stream failure itself; a failed re-read leaves what it streamed. */
       } finally {
         attaching = false;
+        if (!stale) {
+          setFollowing(false);
+        }
+      }
+    };
+
+    /** The caller saw the run end. A stream still open reads the stored rows itself when it ends. */
+    const settle = async (): Promise<void> => {
+      if (stale || !loaded || attaching) {
+        return;
+      }
+      try {
+        await read();
+      } catch {
+        /** What is shown stays; the next open reads again. */
       }
     };
 
@@ -159,8 +191,9 @@ export function useFollowChat({
       }
     };
 
-    setEntry({ id, chat, attach });
+    setEntry({ id, chat, attach, settle });
     setLoad({ id, attempt, state: 'loading' });
+    setFollowing(false);
     void open();
 
     return () => {
@@ -168,15 +201,20 @@ export function useFollowChat({
       applier.reset();
       chat.dispose();
     };
-  }, [id, attempt, queryClient]);
+  }, [id, attempt, enabled, queryClient]);
 
-  const current = entry?.id === id ? entry : undefined;
-  const attach = current?.attach;
+  const current = enabled && entry?.id === id ? entry : undefined;
   useEffect(() => {
-    if (live && attach != null) {
-      void attach();
+    if (current == null) {
+      return;
     }
-  }, [live, attach]);
+    if (live) {
+      void current.attach();
+    } else if (wasLive.current) {
+      void current.settle();
+    }
+    wasLive.current = live;
+  }, [live, current]);
 
   const chat = current?.chat;
   const subscribe = useCallback(
@@ -188,7 +226,8 @@ export function useFollowChat({
   const connection = useSnapshot(subscribe, () => chat?.connection ?? 'idle');
   const error = useSnapshot(subscribe, () => chat?.error);
   const retry = useCallback(() => setAttempt((count) => count + 1), []);
-  const state = load.id === id && load.attempt === attempt ? load.state : 'loading';
+  const tracked = load.id === id && load.attempt === attempt ? load.state : 'loading';
+  const state = enabled ? tracked : 'ready';
 
   return {
     chat,
@@ -197,6 +236,7 @@ export function useFollowChat({
     connection,
     error,
     isLoading: state === 'loading',
+    isFollowing: following && current != null,
     isLoadError: state === 'error',
     retry,
   };
